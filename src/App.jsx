@@ -1,0 +1,1490 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+// 引入图标库
+import { Heart, X, Star, User, ArrowRight, ArrowLeft, Download, CheckCircle, Loader2, Camera, RefreshCw, Check, UploadCloud, AlertCircle, Image as ImageIcon, ShoppingCart, Maximize, Minimize, RefreshCcw } from 'lucide-react';
+
+// --- 配置 ---
+// 默认地址
+const DEFAULT_API_URL = import.meta.env.VITE_API_URL || 'https://crowd-municipal-unbroken.ngrok-free.dev/study2';
+
+const FINAL_SAVE_RETRY_DELAYS_MS = [0, 1200, 3000];
+const SONA_STATUS_POLL_INTERVAL_MS = 1500;
+const SONA_STATUS_MAX_WAIT_MS = 120000;
+const PROFILE_MINIMUM_WAIT_SECONDS = 10 * 60;
+const PROFILE_MINIMUM_WORDS = 50;
+const MAIN_INSTRUCTION_WAIT_SECONDS = 10;
+
+const createParticipantId = () => {
+  const randomPart = globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID().replaceAll('-', '').slice(0, 12)
+    : Math.random().toString(36).slice(2, 14);
+  return `P_${Date.now()}_${randomPart}`;
+};
+
+const createMergeSessionId = () => globalThis.crypto?.randomUUID
+  ? globalThis.crypto.randomUUID().replaceAll('-', '')
+  : Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+
+const readSonaIdFromUrl = () => {
+  const sonaId = new URLSearchParams(window.location.search).get('id');
+  return sonaId ? sonaId.trim() : '';
+};
+
+const createCompactTimestamp = () => {
+  const now = new Date();
+  const pad = value => String(value).padStart(2, '0');
+  return [
+    now.getFullYear(),
+    pad(now.getMonth() + 1),
+    pad(now.getDate()),
+    pad(now.getHours()),
+    pad(now.getMinutes())
+  ].join('');
+};
+
+const wait = (milliseconds) => new Promise(resolve => window.setTimeout(resolve, milliseconds));
+
+const requestJsonWithRetry = async (url, options, retryDelays = [0]) => {
+  let lastError;
+
+  for (let attempt = 0; attempt < retryDelays.length; attempt += 1) {
+    if (retryDelays[attempt] > 0) {
+      await wait(retryDelays[attempt]);
+    }
+
+    try {
+      const response = await fetch(url, options);
+      const responseText = await response.text();
+      let responseBody = {};
+
+      if (responseText) {
+        try {
+          responseBody = JSON.parse(responseText);
+        } catch {
+          responseBody = {};
+        }
+      }
+
+      if (!response.ok) {
+        const requestError = new Error(
+          responseBody.error || `Server returned status ${response.status}`
+        );
+        requestError.retryable = response.status === 429 || response.status >= 500;
+        throw requestError;
+      }
+
+      return responseBody;
+    } catch (error) {
+      lastError = error;
+      const hasAnotherAttempt = attempt < retryDelays.length - 1;
+      if (!hasAnotherAttempt || error.retryable === false) {
+        break;
+      }
+    }
+  }
+
+  throw lastError || new Error('Request failed');
+};
+
+// 问卷题目列表
+const PRE_QUESTIONS = [
+  "comforted",
+  "supported",
+  "looked after",
+  "cared for",
+  "secure",
+  "safe",
+  "protected",
+  "unthreatened",
+  "better about myself",
+  "valued",
+  "more positive about myself",
+  "I really like myself",
+  "loved",
+  "cherished",
+  "treasured",
+  "adored",
+];
+
+// --- 布局组件 ---
+const Layout = ({ children }) => {
+  const [isFullScreen, setIsFullScreen] = useState(false);
+
+  useEffect(() => {
+    const handleChange = () => {
+      setIsFullScreen(!!document.fullscreenElement);
+    };
+    document.addEventListener('fullscreenchange', handleChange);
+    return () => document.removeEventListener('fullscreenchange', handleChange);
+  }, []);
+
+  const toggleFullScreen = () => {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen().catch((err) => {
+        console.error(`Error attempting to enable full-screen mode: ${err.message}`);
+      });
+    } else {
+      if (document.exitFullscreen) {
+        document.exitFullscreen();
+      }
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 relative">
+      <button 
+        onClick={toggleFullScreen}
+        className="fixed top-4 right-4 z-50 p-2 bg-white/60 hover:bg-white backdrop-blur-md rounded-full shadow-md text-slate-600 transition-all duration-300 hover:scale-110"
+        title={isFullScreen ? "Exit Full Screen" : "Enter Full Screen"}
+      >
+        {isFullScreen ? <Minimize size={20} /> : <Maximize size={20} />}
+      </button>
+      {children}
+    </div>
+  );
+};
+
+// --- 摄像头组件 ---
+const CameraCapture = ({ onCapture, onBack, label, instruction }) => {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const streamRef = useRef(null);
+  const [stream, setStream] = useState(null);
+  const [image, setImage] = useState(null);
+  const [error, setError] = useState(null);
+
+  const stopCamera = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setStream(null);
+  }, []);
+
+  const startCamera = useCallback(async () => {
+    try {
+      const mediaStream = await navigator.mediaDevices.getUserMedia({ 
+        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } } 
+      });
+      streamRef.current = mediaStream;
+      setStream(mediaStream);
+      if (videoRef.current) {
+        videoRef.current.srcObject = mediaStream;
+      }
+      setError(null);
+    } catch (err) {
+      console.warn("Camera access failed", err);
+      setError("Camera access is unavailable. Please upload a photo instead.");
+    }
+  }, []);
+
+  useEffect(() => {
+    const startTimer = window.setTimeout(() => {
+      startCamera();
+    }, 0);
+
+    return () => {
+      window.clearTimeout(startTimer);
+      stopCamera();
+    };
+  }, [startCamera, stopCamera]);
+
+  const takePhoto = () => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (video && canvas && video.readyState === 4) {
+      const context = canvas.getContext('2d');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const dataUrl = canvas.toDataURL('image/jpeg');
+      setImage(dataUrl);
+    }
+  };
+
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            setImage(reader.result);
+        };
+        reader.readAsDataURL(file);
+    }
+  };
+
+  const retake = () => {
+    setImage(null);
+    if (!streamRef.current) {
+      startCamera();
+    }
+  };
+
+  const confirm = () => {
+    stopCamera();
+    onCapture(image);
+  };
+
+  const handleBack = () => {
+    stopCamera();
+    onBack();
+  };
+
+  return (
+    <div className="flex flex-col items-center w-full max-w-md mx-auto">
+      <button type="button" onClick={handleBack} className="self-start mb-4 flex items-center gap-2 text-sm font-bold text-slate-600 hover:text-slate-900 transition">
+        <ArrowLeft size={18} /> Back
+      </button>
+      <h3 className="text-xl font-bold mb-2 text-slate-800">{label}</h3>
+      <p className="text-sm text-slate-500 mb-4">{instruction}</p>
+      
+      {error && <div className="bg-red-50 text-red-500 p-4 rounded-lg mb-4 text-sm">{error}</div>}
+
+      <div className="relative w-full aspect-[3/4] bg-black rounded-2xl overflow-hidden mb-6 shadow-xl group">
+          {!image ? (
+            <>
+              <video ref={videoRef} autoPlay playsInline className="absolute inset-0 w-full h-full object-cover transform -scale-x-100" />
+              {!stream && !error && <div className="absolute inset-0 flex items-center justify-center text-slate-500 text-sm">Starting camera...</div>}
+              <div className="absolute inset-0 pointer-events-none flex items-center justify-center opacity-50">
+                 <svg viewBox="0 0 100 100" className="w-2/3 h-2/3 text-white border-2 border-dashed border-white rounded-full">
+                    <path d="M50,10 C30,10 15,25 15,45 C15,60 25,70 30,75 C10,85 0,100 0,100 L100,100 C100,100 90,85 70,75 C75,70 85,60 85,45 C85,25 70,10 50,10 Z" fill="none" stroke="white" strokeWidth="1" strokeDasharray="4"/>
+                 </svg>
+                 <p className="absolute bottom-10 text-white text-sm font-bold bg-black/50 px-3 py-1 rounded">Align face here</p>
+              </div>
+              <canvas ref={canvasRef} className="hidden" />
+              <button onClick={takePhoto} className="absolute bottom-6 left-1/2 transform -translate-x-1/2 w-16 h-16 bg-white rounded-full border-4 border-slate-200 flex items-center justify-center hover:bg-slate-100 transition shadow-lg z-10" title="Take Photo"><Camera className="text-slate-800" size={32} /></button>
+              <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="image/*" className="hidden" />
+              <button onClick={() => fileInputRef.current.click()} className="absolute top-4 right-4 bg-black/50 hover:bg-black/70 text-white p-2 rounded-full backdrop-blur-sm transition pointer-events-auto" title="Upload Photo"><UploadCloud size={20} /></button>
+            </>
+          ) : (
+            <>
+              <img src={image} alt="Captured" className="w-full h-full object-cover" />
+              <div className="absolute bottom-0 w-full bg-black/60 p-4 flex justify-between z-20">
+                <button onClick={retake} className="flex items-center gap-2 text-white hover:text-rose-400 font-medium"><RefreshCw size={20} /> Retake</button>
+                <button onClick={confirm} className="flex items-center gap-2 text-white hover:text-green-400 font-bold"><Check size={20} /> Confirm</button>
+              </div>
+            </>
+          )}
+        </div>
+    </div>
+  );
+};
+
+// --- 主程序入口 ---
+export default function App() {
+  // --- 状态管理 (State) ---
+  const [phase, setPhase] = useState('partner_consent');
+  const [partnerConsentObtained, setPartnerConsentObtained] = useState(null);
+  // ✨ API 地址管理
+  const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL); 
+  const [tempApiUrl, setTempApiUrl] = useState(DEFAULT_API_URL);
+  
+  const [selfGender, setSelfGender] = useState('male');
+  const [partnerGender, setPartnerGender] = useState('female');
+  const [selfPhoto, setSelfPhoto] = useState(null);
+  const [partnerPhoto, setPartnerPhoto] = useState(null);
+  
+  const [userProfileText, setUserProfileText] = useState('');
+  const [questionnaireAnswers, setQuestionnaireAnswers] = useState({});
+  
+  const [currentTrialIndex, setCurrentTrialIndex] = useState(0);
+  const [trialStep, setTrialStep] = useState('card'); 
+  const [trialStartTime, setTrialStartTime] = useState(0); 
+  const [data, setData] = useState([]); 
+  const [stimuli, setStimuli] = useState([]); 
+  const [sourceEvaluationStimuli, setSourceEvaluationStimuli] = useState([]);
+  const [sourceEvaluationData, setSourceEvaluationData] = useState([]);
+  const [currentSourceEvaluationIndex, setCurrentSourceEvaluationIndex] = useState(0);
+  
+  const [currentTrialData, setCurrentTrialData] = useState({});
+  const [ratingDesirability, setRatingDesirability] = useState(4); 
+  const [ratingWillingness, setRatingWillingness] = useState(4);   
+  const [finalRatingDesirability, setFinalRatingDesirability] = useState(4);
+  const [finalRatingAttractiveness, setFinalRatingAttractiveness] = useState(4);
+  
+  const [saveStatus, setSaveStatus] = useState('idle'); 
+  const [isDemoMode, setIsDemoMode] = useState(false); 
+  const [processingError, setProcessingError] = useState('');
+  const [mergeQueuePosition, setMergeQueuePosition] = useState(null);
+  const [saveError, setSaveError] = useState('');
+  const [condition, setCondition] = useState('relationship'); 
+  const [profileWaitSeconds, setProfileWaitSeconds] = useState(PROFILE_MINIMUM_WAIT_SECONDS);
+  const [mainInstructionWaitSeconds, setMainInstructionWaitSeconds] = useState(MAIN_INSTRUCTION_WAIT_SECONDS);
+  const [mainInstructionsCompleted, setMainInstructionsCompleted] = useState(false);
+  // SONA 入口示例：/experiment?id=26893。该编号独立于系统参与者编号保存。
+  const [sonaId] = useState(readSonaIdFromUrl);
+  const [fileStartTimestamp] = useState(createCompactTimestamp);
+  // 在浏览器端立即生成稳定编号，避免多个自动保存请求并发时被后端分配到不同记录。
+  const [participantId, setParticipantId] = useState(createParticipantId);
+  // 每次打开页面生成新会话；同一个 SONA 链接重新进入也不会恢复旧合成任务。
+  const [mergeSessionId] = useState(createMergeSessionId);
+
+  // 后端为本次两张照片生成的文件夹编号
+  const [photoBatchId, setPhotoBatchId] = useState(null);
+
+  const scrollContainerRef = useRef(null);
+  const saveRevisionRef = useRef(0);
+  const fileEndTimestampRef = useRef('');
+  const mergeRequestInFlightRef = useRef(false);
+  const mergeSubmittedRef = useRef(false);
+  const currentPhaseRef = useRef(phase);
+  currentPhaseRef.current = phase;
+  const finishRequestInFlightRef = useRef(false);
+  const finalSaveAttemptedRef = useRef(false);
+
+  useEffect(() => {
+    const handlePageHide = () => {
+      if (currentPhaseRef.current !== 'processing' || !mergeSubmittedRef.current) return;
+      const body = JSON.stringify({ merge_session_id: mergeSessionId });
+      const url = `${apiUrl}/merge_cancel`;
+      const sent = navigator.sendBeacon?.(url, new Blob([body], { type: 'text/plain' }));
+      if (!sent) {
+        fetch(url, { method: 'POST', body, headers: { 'Content-Type': 'text/plain' }, keepalive: true }).catch(() => {});
+      }
+    };
+    const handlePageShow = event => {
+      // 浏览器后退缓存恢复的旧页面也必须从头开始，不能继续使用已取消任务。
+      if (event.persisted) window.location.reload();
+    };
+    window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('pageshow', handlePageShow);
+    return () => {
+      window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('pageshow', handlePageShow);
+    };
+  }, [apiUrl, mergeSessionId]);
+
+  // 初始化条件
+  useEffect(() => {
+    if (partnerConsentObtained !== true) return;
+    const randomCondition = Math.random() < 0.5 ? 'relationship' : 'grocery';
+    setCondition(randomCondition);
+    console.log(`Experiment Condition Assigned: ${randomCondition}`);
+  }, [partnerConsentObtained]);
+
+    // 页面滚动和自动保存
+    useEffect(() => {
+        window.scrollTo(0, 0);
+
+        if (scrollContainerRef.current) {
+            scrollContainerRef.current.scrollTop = 0;
+        }
+
+        // finish 页面由“Finish Experiment”按钮执行正式保存
+        const phasesWithoutAutoSave = [
+            'partner_consent',
+            'partner_consent_required',
+            'gender_select',
+            'face_instructions',
+            'face_rating_instructions',
+            'final_face_instructions',
+            'finish',
+            'end'
+        ];
+
+        if (!phasesWithoutAutoSave.includes(phase)) {
+            saveDataToServer(true);
+        }
+    }, [phase]);
+
+    // 正式实验开始后，任一评价数据发生变化时自动备份；回退至空数据也要覆盖旧备份。
+    useEffect(() => {
+        if (phase === 'experiment' || phase === 'final_face_rating') {
+            saveDataToServer(true);
+        }
+    }, [data, sourceEvaluationData, phase]);
+
+  // --- 事件处理函数 ---
+
+  // 处理重试逻辑 (确保只定义这一次)
+  const handleRetryConnection = () => {
+    setApiUrl(tempApiUrl); // 更新实际使用的 URL
+    setStimuli([]);
+    setSourceEvaluationStimuli([]);
+    setIsDemoMode(false);  
+    setMergeQueuePosition(null);
+    setPhase('processing'); // 重新触发处理流程
+  };
+
+  const handleGenderConfirm = () => {
+    // 先展示面孔合成说明，再进入照片采集。
+    setPhase('face_instructions');
+  };
+
+  const handleReturnToGender = () => {
+    // 性别会影响后端选择的数据库面孔；返回时清除所有尚未使用的下游结果。
+    setSelfPhoto(null);
+    setPartnerPhoto(null);
+    setStimuli([]);
+    setSourceEvaluationStimuli([]);
+    setData([]);
+    setSourceEvaluationData([]);
+    setCurrentTrialIndex(0);
+    setCurrentSourceEvaluationIndex(0);
+    setTrialStep('card');
+    setMainInstructionWaitSeconds(MAIN_INSTRUCTION_WAIT_SECONDS);
+    setMainInstructionsCompleted(false);
+    setPhotoBatchId(null);
+    setProcessingError('');
+    setIsDemoMode(false);
+    setPhase('gender_select');
+  };
+
+  const handleBackFromSelfPhoto = () => {
+    setSelfPhoto(null);
+    setPartnerPhoto(null);
+    setPhase('face_instructions');
+  };
+
+  const handleBackFromPartnerPhoto = () => {
+    // 返回本人照片页时要求重新确认本人照片，确保随后提交的是最后一次选择。
+    setSelfPhoto(null);
+    setPartnerPhoto(null);
+    setPhase('upload_self');
+  };
+
+  const handleSelfCapture = (imgData) => {
+    if (!imgData) return;
+    setSelfPhoto(imgData);
+    setTimeout(() => { setPhase('upload_partner'); }, 100);
+  };
+
+  const handlePartnerCapture = (imgData) => {
+    if (!imgData) return;
+    setPartnerPhoto(imgData);
+    setProcessingError('');
+    setTimeout(() => { setPhase('processing'); }, 100);
+  };
+
+  // 展示和测试用等待时间；不改变任务材料中关于正式书写时长的文字。
+  useEffect(() => {
+    if (phase !== 'profile' || profileWaitSeconds <= 0) return undefined;
+
+    const timer = window.setTimeout(() => {
+      setProfileWaitSeconds(previous => Math.max(0, previous - 1));
+    }, 1000);
+
+    return () => window.clearTimeout(timer);
+  }, [phase, profileWaitSeconds]);
+
+  useEffect(() => {
+    if (phase !== 'face_rating_instructions' || mainInstructionsCompleted) return undefined;
+
+    if (mainInstructionWaitSeconds <= 0) {
+      setMainInstructionsCompleted(true);
+      return undefined;
+    }
+
+    const timer = window.setTimeout(() => {
+      setMainInstructionWaitSeconds(previous => Math.max(0, previous - 1));
+    }, 1000);
+
+    return () => window.clearTimeout(timer);
+  }, [phase, mainInstructionWaitSeconds, mainInstructionsCompleted]);
+
+  // 生成模拟数据
+  const generateMockData = () => {
+    const mockStimuli = [];
+    let idCounter = 1;
+    const ratios = [0, 0.2, 0.4, 0.6, 0.8, 1];
+    const addSeries = (seriesSource, faceCount) => {
+      for (let faceIndex = 1; faceIndex <= faceCount; faceIndex += 1) {
+        const faceRatios = faceIndex === 1 ? ratios : ratios.slice(0, -1);
+        for (const ratio of faceRatios) {
+          const isOriginal = ratio === 1;
+          mockStimuli.push({
+            id: `mock_${seriesSource}_${idCounter++}`,
+            url: `https://api.dicebear.com/7.x/avataaars/svg?seed=${seriesSource}${isOriginal ? 'original' : faceIndex}`,
+            series_source: seriesSource,
+            face_role: isOriginal ? 'original' : ratio === 0 ? 'base_face' : 'blend',
+            ratio_level: ratio,
+            source_db_image: isOriginal ? null : `demo/${seriesSource}_base_${faceIndex}.jpg`
+          });
+        }
+      }
+    };
+
+    addSeries('self', 2);
+    addSeries('partner', 4);
+
+    const sourceEvaluationImages = mockStimuli
+      .filter(stimulus => stimulus.face_role === 'base_face' || stimulus.face_role === 'original')
+      .map(stimulus => ({ ...stimulus, id: `final_${stimulus.id}` }))
+      .sort(() => Math.random() - 0.5);
+
+    return {
+      images: mockStimuli.sort(() => Math.random() - 0.5),
+      source_evaluation_images: sourceEvaluationImages
+    };
+  };
+
+  // 核心：只提交一次任务，随后轮询排队/处理状态；完成时接收Base64图片。
+  useEffect(() => {
+    if (phase === 'processing' && !mergeRequestInFlightRef.current) {
+      mergeRequestInFlightRef.current = true;
+      mergeSubmittedRef.current = true;
+
+      const processImages = async () => {
+        try {
+          console.log("Connecting to backend:", apiUrl);
+          
+          const response = await fetch(`${apiUrl}/merge_faces`, {
+            method: 'POST',
+            headers: { 
+              'Content-Type': 'application/json', 
+              'ngrok-skip-browser-warning': 'true' 
+            },
+            body: JSON.stringify({
+              participant_id: participantId,
+              merge_session_id: mergeSessionId,
+              self_image: selfPhoto,
+              partner_image: partnerPhoto,
+              self_gender: selfGender,
+              partner_gender: partnerGender
+            }),
+          });
+          
+          if (!response.ok) {
+            const errorBody = await response.json().catch(() => ({}));
+
+            const requiresNewPhotographs = response.status === 422 && [
+              'FACE_QUALITY_ERROR',
+              'FACE_OCCLUSION_ERROR'
+            ].includes(errorBody.code);
+            const photoCheckUnavailable = response.status === 503 &&
+              errorBody.code === 'FACE_OCCLUSION_CHECK_UNAVAILABLE';
+
+            if (requiresNewPhotographs || photoCheckUnavailable) {
+              setProcessingError(errorBody.error);
+              if (requiresNewPhotographs) {
+                setSelfPhoto(null);
+                setPartnerPhoto(null);
+              }
+              setPhotoBatchId(null);
+              setPhase('photo_quality_error');
+              return;
+            }
+
+            throw new Error(`Server status ${response.status}: ${errorBody.error || 'Unknown error'}`);
+          }
+          
+          let result = await response.json();
+          const jobId = result.job_id;
+
+          while (jobId && !Array.isArray(result.images)) {
+            if (result.status === 'queued') {
+              setMergeQueuePosition(result.queue_position || 1);
+            } else if (result.status === 'processing') {
+              // 一旦获得处理名额，等待说明立即消失。
+              setMergeQueuePosition(null);
+            }
+
+            await new Promise(resolve => window.setTimeout(resolve, 1000));
+            const statusResponse = await fetch(
+              `${apiUrl}/merge_status/${encodeURIComponent(jobId)}`,
+              {
+                headers: {
+                  'ngrok-skip-browser-warning': 'true',
+                  'X-Merge-Session': mergeSessionId
+                }
+              }
+            );
+            const statusBody = await statusResponse.json().catch(() => ({}));
+            if (!statusResponse.ok) {
+              if (statusResponse.status === 410) {
+                setMergeQueuePosition(null);
+                mergeSubmittedRef.current = false;
+                setProcessingError('This photo-processing session has ended. Please restart the experiment from the beginning.');
+                setPhase('processing_cancelled');
+                return;
+              }
+              if (statusResponse.status === 422 ||
+                (statusResponse.status === 503 && statusBody.code === 'FACE_OCCLUSION_CHECK_UNAVAILABLE')) {
+                setProcessingError(statusBody.error);
+                if (statusResponse.status === 422) {
+                  setSelfPhoto(null);
+                  setPartnerPhoto(null);
+                }
+                setMergeQueuePosition(null);
+                mergeSubmittedRef.current = false;
+                setPhotoBatchId(null);
+                setPhase('photo_quality_error');
+                return;
+              }
+              throw new Error(
+                `Server status ${statusResponse.status}: ` +
+                (statusBody.error || 'Face processing failed')
+              );
+            }
+            result = statusBody;
+          }
+
+          if (
+            !Array.isArray(result.images)
+            || result.images.length !== 32
+            || !Array.isArray(result.source_evaluation_images)
+            || result.source_evaluation_images.length !== 8
+          ) {
+            throw new Error('The server returned an incomplete face-image set.');
+          }
+
+          setMergeQueuePosition(null);
+          if (result.participant_id) {
+            setParticipantId(result.participant_id);
+          }
+          setStimuli(result.images);
+          setSourceEvaluationStimuli(result.source_evaluation_images);
+          setPhotoBatchId(result.photo_batch_id || null);
+          mergeSubmittedRef.current = false;
+          setPhase('instructions');
+
+        } catch (error) {
+          console.warn("Backend connection failed:", error);
+          setMergeQueuePosition(null);
+          
+          // 进入演示模式，但在界面上允许重试
+          setIsDemoMode(true); 
+          const mockData = generateMockData();
+          setStimuli(mockData.images);
+          setSourceEvaluationStimuli(mockData.source_evaluation_images);
+          setPhotoBatchId(null);
+          mergeSubmittedRef.current = false;
+          setPhase('instructions'); 
+        } finally {
+          mergeRequestInFlightRef.current = false;
+        }
+      };
+      processImages();
+    }
+  }, [phase, apiUrl, participantId, mergeSessionId, selfPhoto, partnerPhoto, selfGender, partnerGender]);
+
+  // 记录试次开始时间
+  useEffect(() => {
+    if (phase === 'experiment' && trialStep === 'card') {
+      setTrialStartTime(performance.now());
+    }
+  }, [phase, trialStep, currentTrialIndex]);
+
+  const readFinalSaveStatus = async () => {
+    const response = await fetch(`${apiUrl}/save_status`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'ngrok-skip-browser-warning': 'true'
+      },
+      body: JSON.stringify({
+        participant_id: participantId,
+        sona_id: sonaId,
+        file_start_timestamp: fileStartTimestamp
+      })
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(body.error || `Status check failed (${response.status}).`);
+    }
+    return body;
+  };
+
+  const waitForSonaResult = async (initialStatus) => {
+    const deadline = Date.now() + SONA_STATUS_MAX_WAIT_MS;
+    let current = initialStatus;
+    let missingChecks = 0;
+    let networkFailures = 0;
+
+    while (Date.now() < deadline) {
+      if (current.status === 'success') return;
+      if (current.status === 'failed') {
+        throw new Error(
+          `Your responses were saved, but SONA credit could not be confirmed: ${current.sona_completion?.message || 'Unknown error'}. Please click again to check and retry, or contact the researcher.`
+        );
+      }
+      if (current.status === 'unknown') {
+        throw new Error('Your responses were saved, but SONA confirmation was interrupted. Please click again to check its status and retry, or contact the researcher.');
+      }
+      if (current.status === 'not_found' || current.status === 'partial') {
+        missingChecks += 1;
+        if (missingChecks >= 5) {
+          throw new Error('Final submission could not be confirmed. Please click again to check its status before retrying.');
+        }
+      }
+
+      await wait(SONA_STATUS_POLL_INTERVAL_MS);
+      try {
+        current = await readFinalSaveStatus();
+        networkFailures = 0;
+      } catch (error) {
+        networkFailures += 1;
+        if (networkFailures >= 4) {
+          throw new Error(`Unable to check SONA confirmation: ${error.message}. Your responses may already be saved; please click again to check the status, or contact the researcher.`);
+        }
+      }
+    }
+
+    throw new Error('SONA confirmation is still pending. Please keep this page open and click again to check its status; do not start another experiment.');
+  };
+
+  // 数据保存逻辑
+  const saveDataToServer = async (isPartial = false, isComplete = false) => {
+    if (!isPartial) {
+      setSaveStatus('saving');
+      setSaveError('');
+    }
+
+    const saveRevision = saveRevisionRef.current + 1;
+    saveRevisionRef.current = saveRevision;
+    if (isComplete && !fileEndTimestampRef.current) {
+      fileEndTimestampRef.current = createCompactTimestamp();
+    }
+
+    const exportData = {
+      participant_id: participantId,
+      save_revision: saveRevision,
+      sona_id: sonaId,
+      file_start_timestamp: fileStartTimestamp,
+      file_end_timestamp: isComplete ? fileEndTimestampRef.current : '',
+      timestamp: new Date().toISOString(),
+      condition_group: condition,
+      gender_info: { self: selfGender, partner: partnerGender },
+      sexual_orientation: selfGender === partnerGender ? 'homosexual' : 'heterosexual',
+      partner_consent_obtained: partnerConsentObtained === true,
+      photo_batch_id: photoBatchId,
+      user_profile: userProfileText,
+      pre_questionnaire: questionnaireAnswers,
+      experiment_data: data,
+      source_face_evaluations: sourceEvaluationData,
+      mode: isDemoMode ? 'demo' : 'production',
+      is_complete: isComplete
+    };
+
+    if (isDemoMode) {
+        return true;
+    }
+
+    try {
+      if (isComplete) {
+        // 一旦提交过，任何后续点击都先查状态；仅明确失败/中断才重试授权。
+        if (finalSaveAttemptedRef.current) {
+          const current = await readFinalSaveStatus();
+          if (current.status === 'success') return true;
+          if (current.status === 'pending') {
+            await waitForSonaResult(current);
+            return true;
+          }
+          // 只有查到失败或中断，才显式授权这次重新请求 SONA。
+          exportData.retry_sona_credit = ['failed', 'unknown'].includes(current.status);
+        }
+
+        finalSaveAttemptedRef.current = true;
+        let initialStatus;
+        try {
+          const response = await fetch(`${apiUrl}/save_data`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+              'ngrok-skip-browser-warning': 'true'
+            },
+            body: JSON.stringify(exportData)
+          });
+          initialStatus = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(initialStatus.error || `Final submission failed (${response.status}).`);
+          }
+        } catch (error) {
+          // 提交请求可能已到达后端；不在这里盲目发送第二次最终保存。
+          console.warn('Final submission response unavailable; checking saved state:', error);
+          initialStatus = await readFinalSaveStatus();
+        }
+
+        await waitForSonaResult(initialStatus);
+        return true;
+      }
+
+      const result = await requestJsonWithRetry(
+        `${apiUrl}/save_data`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'ngrok-skip-browser-warning': 'true'
+          },
+          body: JSON.stringify(exportData)
+        },
+        isPartial ? [0] : FINAL_SAVE_RETRY_DELAYS_MS
+      );
+
+      if (result.participant_id) {
+        setParticipantId(result.participant_id);
+      }
+      return true;
+    } catch (e) {
+      console.error(e);
+      if (!isPartial) {
+        setSaveError(`Unable to complete the experiment: ${e.message}`);
+        setSaveStatus('error');
+      }
+      return false;
+    }
+  };
+
+  // 完成实验后，通知后端删除本次上传的两张照片
+  const deleteParticipantFaces = async () => {
+    if (isDemoMode || !photoBatchId) return true;
+
+    try {
+      await requestJsonWithRetry(
+        `${apiUrl}/delete_participant_faces`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'ngrok-skip-browser-warning': 'true'
+          },
+          body: JSON.stringify({ photo_batch_id: photoBatchId })
+        },
+        FINAL_SAVE_RETRY_DELAYS_MS
+      );
+      return true;
+    } catch (e) {
+      console.error(e);
+      setSaveError(`Data was saved, but photograph deletion failed: ${e.message}`);
+      return false;
+    }
+  };
+
+  const handleFinishExperiment = async () => {
+    if (finishRequestInFlightRef.current) return;
+    finishRequestInFlightRef.current = true;
+    try {
+      setSaveStatus('saving');
+      setSaveError('');
+      const dataSaved = await saveDataToServer(false, true);
+      if (!dataSaved) return;
+
+      const photosDeleted = await deleteParticipantFaces();
+      if (!photosDeleted) {
+        setSaveStatus('error');
+        return;
+      }
+
+      // 后端删除成功后，也清除浏览器内存中的照片数据
+      setSelfPhoto(null);
+      setPartnerPhoto(null);
+      setPhotoBatchId(null);
+      setPhase('end');
+    } finally {
+      finishRequestInFlightRef.current = false;
+    }
+  };
+
+  // --- Views ---
+
+  if (phase === 'partner_consent') {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 pt-20 min-h-screen">
+          <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-2xl">
+            <h1 className="text-2xl font-bold text-center mb-6 text-slate-800">Partner Photograph Consent</h1>
+            <div className="space-y-4 text-slate-600 leading-relaxed mb-8">
+              <p>Before continuing, please confirm that your partner has agreed to the use of their photograph in this study.</p>
+              <p className="font-bold text-slate-800">Have you obtained your partner&apos;s consent to use their photograph in this study?</p>
+            </div>
+            <div className="space-y-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setPartnerConsentObtained(true);
+                  setPhase('gender_select');
+                }}
+                className="w-full rounded-xl bg-slate-900 px-4 py-4 font-bold text-white transition hover:bg-slate-800"
+              >
+                Yes, I have obtained my partner&apos;s consent.
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setPartnerConsentObtained(false);
+                  setPhase('partner_consent_required');
+                }}
+                className="w-full rounded-xl border-2 border-slate-300 bg-white px-4 py-4 font-bold text-slate-700 transition hover:bg-slate-50"
+              >
+                No, I have not obtained my partner&apos;s consent.
+              </button>
+            </div>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (phase === 'partner_consent_required') {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 min-h-screen">
+          <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-2xl text-center">
+            <AlertCircle size={56} className="text-amber-500 mx-auto mb-5" />
+            <h1 className="text-2xl font-bold mb-6 text-slate-800">Partner Consent Required</h1>
+            <div className="space-y-4 text-slate-600 leading-relaxed">
+              <p>You cannot continue with this study until you have obtained your partner&apos;s consent to use their photograph.</p>
+              <p>Please obtain their consent before taking part. Once you have obtained consent, you may use the same study link to start the experiment again.</p>
+              <p>Because you have not completed the study, no credit will be awarded at this time. You may now close this page.</p>
+            </div>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (phase === 'gender_select') {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 pt-20">
+          <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md">
+            <h1 className="text-2xl font-bold text-center mb-6">Basic Information</h1>
+            <div className="mb-6">
+              <label className="block text-sm font-bold text-slate-700 mb-2">Your Gender</label>
+              <div className="flex gap-4">
+                <button onClick={() => setSelfGender('male')} className={`flex-1 py-3 rounded-lg border-2 ${selfGender === 'male' ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200'}`}>Male</button>
+                <button onClick={() => setSelfGender('female')} className={`flex-1 py-3 rounded-lg border-2 ${selfGender === 'female' ? 'border-rose-500 bg-rose-50 text-rose-700' : 'border-slate-200'}`}>Female</button>
+              </div>
+            </div>
+            <div className="mb-8">
+              <label className="block text-sm font-bold text-slate-700 mb-2">Partner&apos;s Gender</label>
+              <div className="flex gap-4">
+                <button onClick={() => setPartnerGender('male')} className={`flex-1 py-3 rounded-lg border-2 ${partnerGender === 'male' ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200'}`}>Male</button>
+                <button onClick={() => setPartnerGender('female')} className={`flex-1 py-3 rounded-lg border-2 ${partnerGender === 'female' ? 'border-rose-500 bg-rose-50 text-rose-700' : 'border-slate-200'}`}>Female</button>
+              </div>
+            </div>
+            <button onClick={handleGenderConfirm} className="w-full bg-slate-900 text-white font-bold py-3 rounded-xl hover:bg-slate-800 transition">Next</button>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (phase === 'face_instructions') {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 pt-20 min-h-screen">
+          <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-2xl">
+            <button type="button" onClick={handleReturnToGender} className="mb-5 flex items-center gap-2 text-sm font-bold text-slate-600 hover:text-slate-900 transition">
+              <ArrowLeft size={18} /> Back
+            </button>
+            <h2 className="text-2xl font-bold mb-6 text-slate-800">Photo Instructions</h2>
+            <div className="text-slate-600 space-y-4 mb-8 leading-relaxed">
+              <p>Please upload <strong>one photograph of yourself</strong> and <strong>one of your partner</strong> for this study. You will then complete dating-choice and face-rating tasks.</p>
+              <p>Both photographs must show <strong>one clear, front-facing face with a neutral expression</strong> and <strong>no glasses, sunglasses, or face coverings</strong>.</p>
+              <p>The photographs will be stored locally on the research computer, will be accessible only to the researcher, will not be shared with any third party, and will be permanently deleted after you complete the experiment.</p>
+            </div>
+            <button onClick={() => setPhase('upload_self')} className="w-full bg-slate-900 text-white font-bold py-3 rounded-xl hover:bg-slate-800 transition">Continue</button>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+    if (phase === 'upload_self') {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 pt-20">
+            <div className="w-full bg-white p-6 rounded-2xl shadow-xl max-w-md">
+            <div className="flex justify-center mb-4"><div className="w-full h-2 bg-slate-100 rounded-full"><div className="h-full bg-rose-500 w-1/3"></div></div></div>
+            <CameraCapture key="capture-self" label="Step 1/2: Take Your Photo" instruction={<>Please show <strong>one clear, front-facing face with a neutral expression</strong> and <strong>no glasses, sunglasses, or face coverings</strong>.</>} onCapture={handleSelfCapture} onBack={handleBackFromSelfPhoto} />
+            </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (phase === 'upload_partner') {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 pt-20">
+            <div className="w-full bg-white p-6 rounded-2xl shadow-xl max-w-md">
+            <div className="flex justify-center mb-4"><div className="w-full h-2 bg-slate-100 rounded-full"><div className="h-full bg-rose-500 w-2/3"></div></div></div>
+            <CameraCapture key="capture-partner" label="Step 2/2: Take Partner's Photo" instruction={<>Please use or upload <strong>one clear, front-facing photograph of your partner with a neutral expression</strong> and <strong>no glasses, sunglasses, or face coverings</strong>. If your partner is not present, you may upload an existing photograph that meets these requirements.</>} onCapture={handlePartnerCapture} onBack={handleBackFromPartnerPhoto} />
+            </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (phase === 'processing') {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 pt-20 h-screen bg-slate-900">
+          <Loader2 size={64} className="animate-spin text-rose-500 mb-6" />
+          <h2 className="text-2xl font-bold mb-4 text-white text-center">We’re analysing your photos and matching you with profiles to rate...</h2>
+          <div className="text-slate-300 text-sm space-y-3 text-center max-w-md">
+            {mergeQueuePosition !== null ? (
+              <div className="rounded-xl border border-amber-400/40 bg-amber-400/10 px-5 py-4 text-amber-100">
+                <p className="font-semibold">Other participants are currently being processed.</p>
+                <p className="mt-2">Your current position in the queue is {mergeQueuePosition}. Processing will start automatically.</p>
+              </div>
+            ) : (
+              <p>This process usually takes <strong>about 1 minute</strong>.</p>
+            )}
+            <p><strong>Please keep this page open.</strong> Closing or refreshing it cancels your place in the queue; reopening the link starts a new experiment.</p>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (phase === 'processing_cancelled') {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 min-h-screen">
+          <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-lg text-center">
+            <h2 className="text-2xl font-bold mb-4">Photo processing ended</h2>
+            <p className="mb-6">{processingError}</p>
+            <button type="button" onClick={() => window.location.reload()} className="w-full rounded-xl bg-slate-900 p-4 font-semibold text-white">Restart Experiment</button>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (phase === 'photo_quality_error') {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 min-h-screen">
+          <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-lg text-center">
+            <AlertCircle size={56} className="text-amber-500 mx-auto mb-5" />
+            <h2 className="text-2xl font-bold mb-4 text-slate-800">Photo Check Needed</h2>
+            <p className="text-slate-600 leading-relaxed mb-4">{processingError}</p>
+            <p className="text-sm text-slate-500 mb-8">Please retake or replace both photographs. Each photograph must show one clear, front-facing face with a neutral expression and no glasses, sunglasses, or face coverings.</p>
+            <button type="button" onClick={() => setPhase('upload_self')} className="w-full bg-slate-900 text-white font-bold py-3 rounded-xl hover:bg-slate-800 transition">Retake Photos</button>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (phase === 'instructions') {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 pt-20">
+            <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md">
+            <h2 className="text-xl font-bold mb-4 text-slate-800">Ready</h2>
+            
+            {isDemoMode && (
+                <div className="bg-amber-50 border border-amber-200 p-4 rounded-xl mb-6 text-sm">
+                  <div className="flex items-start gap-2 text-amber-800 mb-3">
+                    <AlertCircle size={20} className="shrink-0 mt-0.5"/>
+                    <div>
+                      <strong>Connection Failed</strong>
+                      <p className="opacity-90 mt-1">The research server could not be reached or could not process your photographs.</p>
+                      <p className="opacity-90 mt-2">Please click Retry to reconnect. If you still cannot connect after several attempts, please contact the researcher. Demo mode uses practice images, does not save your responses, and does not award SONA credit.</p>
+                    </div>
+                  </div>
+                  
+                  <div className="bg-white/50 p-3 rounded-lg">
+                    <label className="block text-xs font-bold text-amber-800 mb-1">Update Ngrok URL & Retry:</label>
+                    <div className="flex gap-2">
+                      <input 
+                        type="text" 
+                        value={tempApiUrl} 
+                        onChange={(e) => setTempApiUrl(e.target.value)}
+                        className="flex-1 border border-amber-300 rounded px-2 py-1 text-xs text-slate-700 focus:outline-none focus:border-amber-500"
+                        placeholder="e.g. https://xxxx.ngrok-free.app"
+                      />
+                      <button 
+                        onClick={handleRetryConnection}
+                        className="bg-amber-600 hover:bg-amber-700 text-white px-3 py-1 rounded text-xs font-bold flex items-center gap-1 transition"
+                      >
+                        <RefreshCcw size={12} /> Retry
+                      </button>
+                    </div>
+                  </div>
+                </div>
+            )}
+
+            <p className="text-slate-600 mb-6 text-sm">System has prepared potential matches. Please follow your intuition.</p>
+            <button onClick={() => setPhase('profile')} className="w-full bg-slate-900 text-white font-bold py-3 rounded-xl">{isDemoMode ? 'Continue in Demo Mode (No Credit)' : 'Start Experiment'}</button>
+            </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (phase === 'profile') {
+     const profileWordCount = userProfileText.trim()
+       ? userProfileText.trim().split(/\s+/).length
+       : 0;
+     const hasMinimumProfileWords = profileWordCount >= PROFILE_MINIMUM_WORDS;
+     const hasCompletedProfileWait = profileWaitSeconds === 0;
+     const canContinueProfile = hasMinimumProfileWords && hasCompletedProfileWait;
+     return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 pt-10">
+            <div ref={scrollContainerRef} className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-3xl overflow-y-auto max-h-[90vh]">
+            <div className="flex items-center gap-3 mb-6 border-b border-slate-100 pb-4">
+                <div className={`p-3 rounded-full ${condition === 'relationship' ? 'bg-rose-100 text-rose-500' : 'bg-blue-100 text-blue-500'}`}>
+                {condition === 'relationship' ? <Heart size={24} fill="currentColor" /> : <ShoppingCart size={24} />}
+                </div>
+                <h2 className="text-2xl font-bold text-slate-800">{condition === 'relationship' ? 'Relationship Reflection' : 'Shopping Experience'}</h2>
+            </div>
+            <div className="text-slate-600 space-y-4 mb-8 text-sm leading-relaxed text-justify">
+                {condition === 'relationship' ? (
+                    <>
+                        <p>Before rating the profiles, please complete the following task.</p>
+                        <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                            <p>Please take time to think carefully about a close relationship in which you find it <strong><em>easy to feel close</em></strong> to the other person and are <strong><em>comfortable relying on them</em></strong>. This person you are thinking about should be <strong><em>someone who is always there for you</em></strong> when you are in need.</p>
+                        </div>
+                        <p>You should now have a person in mind. Please imagine what they look like and what it is like to be in their company.</p>
+                        <p>Now you have the person in mind, think about how you do not worry about being abandoned by this person or worry that this person would try to get closer to you than you are comfortable being.</p>
+                        <p>Please write about this person, your shared time together, and how this person makes you feel safe, comforted, and loved. There may be a particular time or example of these good things in the relationship that you could recall here. The task will be timed with a <strong>10-minute countdown timer</strong>.</p>
+                    </>
+                ) : (
+                    <>
+                        <p>Before rating the profiles, please complete the following task.</p>
+                        <p>This task requires you to identify and write for <strong>10 minutes</strong> (in the box next page) about a recent retail experience you had. We won’t read or keep what you write (though we will check that you have written at least a few paragraphs of text), so please feel free to write in a disinhibited and unguarded way. The exercise is just about having you visualise a situation.</p>
+                        <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                            <p className="mb-2">Please take time to think carefully about a time when you visited a grocery store <strong>alone</strong> to buy grocery products.</p>
+                            <p>This must be a time when you were out shopping alone, with no friends or acquaintances.</p>
+                        </div>
+                        <p>You should now have a recent shopping time in mind. Please imagine the details of this trip.</p>
+                        <p>Now you have a particular shopping trip in mind, imagine and describe the route from your home to the store, the appearance of the store, the ease with which you found what you were looking for and the groceries you purchased.</p>
+                        <p>Please write down as much as you can about this grocery store trip. The task will be timed with a <strong>10-minute countdown timer</strong>.</p>
+                    </>
+                )}
+            </div>
+            <div className="mb-6">
+                <label className="flex items-center justify-between gap-3 text-slate-700 font-bold mb-2">
+                    <span>Your Response:</span>
+                    <span className={`text-xs font-medium ${hasMinimumProfileWords ? 'text-green-600' : 'text-slate-500'}`}>
+                        {profileWordCount}/<strong>50 words minimum</strong>
+                    </span>
+                </label>
+                <textarea className="w-full border border-slate-300 rounded-xl p-4 h-80 focus:ring-2 focus:ring-rose-500 focus:outline-none transition-all resize-y text-sm leading-relaxed" 
+                    placeholder={condition === 'relationship' ? "There may be a particular time or example of these good things in the relationship that you could recall here. The task will be timed." : "Please write down as much as you can about this grocery store trip. The task will be timed."}
+                    value={userProfileText} onChange={e=>setUserProfileText(e.target.value)} 
+                />
+                {!hasMinimumProfileWords && (
+                    <p className="mt-2 text-xs text-rose-500">Please write at least <strong>50 words</strong> before continuing.</p>
+                )}
+                {!hasCompletedProfileWait && (
+                    <p className="mt-2 text-xs text-slate-500">Next Step will be available in {profileWaitSeconds} seconds.</p>
+                )}
+            </div>
+            <button disabled={!canContinueProfile} onClick={() => setPhase('questionnaire')} className={`w-full font-bold py-4 rounded-xl transition-all duration-300 flex items-center justify-center gap-2 ${canContinueProfile ? 'bg-rose-500 hover:bg-rose-600 text-white shadow-lg hover:shadow-xl transform hover:-translate-y-0.5' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}>
+                <span>Next Step</span><ArrowRight size={20} />
+            </button>
+            </div>
+        </div>
+      </Layout>
+     );
+  }
+
+  if (phase === 'questionnaire') {
+    const isComplete = Object.keys(questionnaireAnswers).length === PRE_QUESTIONS.length;
+    return (
+      <Layout>
+        <div className="flex justify-center p-6 pt-20 min-h-screen">
+            <div ref={scrollContainerRef} className="bg-white p-6 rounded-2xl shadow-xl w-full max-w-md overflow-y-auto max-h-[85vh]">
+            <h2 className="text-xl font-bold mb-4">Ratings</h2>
+            <div className="mb-6 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm leading-relaxed text-slate-700">
+                <p className="mb-3">Please respond to the items below using the following <strong>6-point scale</strong>, thinking about how the visualisation task you <strong>JUST PERFORMED</strong> makes you feel.</p>
+                <p className="font-medium">Thinking about the visualisation task I <strong>JUST PERFORMED</strong> makes me feel. <strong>(1 = not at all, 6 = very much)</strong></p>
+            </div>
+            {PRE_QUESTIONS.map((q, idx) => (
+                <div key={idx} className="mb-4 text-sm">
+                    <p className="mb-2">{idx + 1}. {q}</p>
+                    <div className="flex justify-between">{[1,2,3,4,5,6].map(n=><button key={n} onClick={()=>setQuestionnaireAnswers(p=>({...p,[idx]:n}))} className={`w-8 h-8 rounded-full ${questionnaireAnswers[idx]===n?'bg-rose-500 text-white':'bg-slate-100'}`}>{n}</button>)}</div>
+                </div>
+                ))}
+                <button disabled={!isComplete} onClick={() => setPhase('face_rating_instructions')} className={`w-full mt-4 font-bold py-3 rounded-xl ${!isComplete?'bg-slate-300':'bg-slate-900 text-white'}`}>Continue</button>
+            </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (phase === 'face_rating_instructions') {
+    const perspectiveInstruction = selfGender === partnerGender
+      ? null
+      : selfGender === 'male'
+        ? <>When you see profiles of men, <strong>imagine that you are a woman browsing a dating app</strong> and rate each profile as <strong>a potential match</strong>.</>
+        : <>When you see profiles of women, <strong>imagine that you are a man browsing a dating app</strong> and rate each profile as <strong>a potential match</strong>.</>;
+    const canStartMainTask = mainInstructionsCompleted;
+
+    return (
+      <Layout>
+        <div className="flex items-center justify-center p-6 pt-20 min-h-screen">
+          <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-2xl">
+            <button type="button" onClick={() => {
+              if (!mainInstructionsCompleted) {
+                setMainInstructionWaitSeconds(MAIN_INSTRUCTION_WAIT_SECONDS);
+              }
+              setPhase('questionnaire');
+            }} className="mb-5 flex items-center gap-2 text-sm font-bold text-slate-600 hover:text-slate-900 transition">
+              <ArrowLeft size={18} /> Back
+            </button>
+            <div className="space-y-4 text-slate-600 leading-relaxed">
+              <p>In the next part of the study, please imagine that you are <strong>browsing profiles on a dating app</strong>. You will see a series of face photographs, presented one at a time.</p>
+              {perspectiveInstruction && (
+                <p className="rounded-xl border border-blue-200 bg-blue-50 p-4 font-semibold text-blue-900">{perspectiveInstruction}</p>
+              )}
+              <p>Please respond to each face as naturally as you would when using a dating app, based on your immediate impression:</p>
+              <p>After each choice, you will rate the person on <strong>desirability</strong> and <strong>willingness to date</strong>.</p>
+              <div className="space-y-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <div className="flex items-center gap-3"><X className="shrink-0 text-[#ff4458]" size={27} strokeWidth={4} /><span>Select <strong>X (Nope)</strong> if you would pass on the profile.</span></div>
+                <div className="flex items-center gap-3"><Star className="shrink-0 text-[#168dcc]" size={27} fill="#2db8ff" strokeWidth={2.5} /><span>Select <strong>★ (Super Like)</strong> if this person stands out to you and a Like does not feel strong enough.</span></div>
+                <div className="flex items-center gap-3"><Heart className="shrink-0 text-[#14a97f]" size={27} fill="#42e29d" strokeWidth={2.5} /><span>Select <strong>♥ (Like)</strong> if you are interested in the profile.</span></div>
+              </div>
+              <p>There are <strong>no right or wrong answers</strong>.</p>
+            </div>
+            <button
+              disabled={!canStartMainTask}
+              onClick={() => setPhase('experiment')}
+              className={`w-full mt-8 font-bold py-3 rounded-xl transition ${canStartMainTask ? 'bg-slate-900 text-white hover:bg-slate-800' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}
+            >
+              {canStartMainTask ? 'Start Browsing (32 Photos)' : `Please read the instructions (${mainInstructionWaitSeconds}s)`}
+            </button>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  const handleCardAction = (action) => {
+    const rt = performance.now() - trialStartTime;
+    const stim = stimuli[currentTrialIndex];
+    setCurrentTrialData({
+      trial_index: currentTrialIndex + 1,
+      stimulus_id: stim.id,
+      series_source: stim.series_source,
+      face_role: stim.face_role,
+      ratio_level: stim.ratio_level,
+      source_db_image: stim.source_db_image,
+      action: action,
+      reaction_time_ms: Math.round(rt),
+    });
+    setRatingDesirability(4); setRatingWillingness(4); setTrialStep('rating');
+  };
+
+  const handleTrialBack = () => {
+    if (trialStep === 'rating') {
+      // 当前选择尚未写入 data；返回卡片后重新选择即可覆盖本次临时结果。
+      setCurrentTrialData({});
+      setRatingDesirability(4);
+      setRatingWillingness(4);
+      setTrialStep('card');
+      return;
+    }
+
+    if (currentTrialIndex === 0) {
+      setCurrentTrialData({});
+      setData([]);
+      setPhase('face_rating_instructions');
+      return;
+    }
+
+    const previousTrialIndex = currentTrialIndex - 1;
+    // 删除返回目标试次及其后的旧答案；重做后只保留最后一次结果。
+    setData(previous => previous.filter(
+      trial => trial.trial_index < previousTrialIndex + 1
+    ));
+    setCurrentTrialData({});
+    setRatingDesirability(4);
+    setRatingWillingness(4);
+    setCurrentTrialIndex(previousTrialIndex);
+    setTrialStep('card');
+  };
+
+  const handleRatingSubmit = () => {
+    const completeData = { ...currentTrialData, rating_desirability: ratingDesirability, rating_willingness: ratingWillingness };
+    const newData = [
+      ...data.filter(trial => trial.trial_index !== completeData.trial_index),
+      completeData
+    ].sort((left, right) => left.trial_index - right.trial_index);
+    setData(newData);
+    if (currentTrialIndex < stimuli.length - 1) {
+      setCurrentTrialIndex(prev => prev + 1);
+      setTrialStep('card');
+    } else {
+      setPhase('final_face_instructions');
+    }
+  };
+
+  if (phase === 'experiment' && trialStep === 'card') {
+    const currentStim = stimuli[currentTrialIndex];
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-4 min-h-screen">
+            <button type="button" onClick={handleTrialBack} className="w-full max-w-sm mb-4 flex items-center gap-2 text-sm font-bold text-slate-600 hover:text-slate-900 transition">
+              <ArrowLeft size={18} /> Back
+            </button>
+            <div className="relative w-full max-w-sm aspect-[3/4] bg-white rounded-3xl shadow-2xl overflow-hidden mb-6">
+            <img src={currentStim.url} className="w-full h-full object-cover" alt="Face" />
+            </div>
+            <div className="flex items-center justify-center gap-5">
+            <button type="button" aria-label="Nope" title="Nope" onClick={() => handleCardAction('dislike')} className="w-20 h-20 bg-white rounded-full border border-slate-100 shadow-[0_10px_30px_rgba(15,23,42,0.18)] text-[#ff4458] flex items-center justify-center transition duration-200 hover:scale-110 hover:bg-[#fff7f8] active:scale-95 focus:outline-none focus-visible:ring-4 focus-visible:ring-[#ff4458]/25"><X size={45} strokeWidth={4} /></button>
+            <button type="button" aria-label="Super Like" title="Super Like" onClick={() => handleCardAction('superlike')} className="w-16 h-16 bg-white rounded-full border border-slate-100 shadow-[0_9px_24px_rgba(15,23,42,0.16)] text-[#168dcc] flex items-center justify-center transition duration-200 hover:scale-110 hover:bg-[#f5fbff] active:scale-95 focus:outline-none focus-visible:ring-4 focus-visible:ring-[#2db8ff]/25"><Star size={35} fill="#2db8ff" strokeWidth={2.5} /></button>
+            <button type="button" aria-label="Like" title="Like" onClick={() => handleCardAction('like')} className="w-20 h-20 bg-white rounded-full border border-slate-100 shadow-[0_10px_30px_rgba(15,23,42,0.18)] text-[#14a97f] flex items-center justify-center transition duration-200 hover:scale-110 hover:bg-[#f4fff9] active:scale-95 focus:outline-none focus-visible:ring-4 focus-visible:ring-[#42e29d]/25"><Heart size={43} fill="#42e29d" strokeWidth={2.5} /></button>
+            </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (phase === 'experiment' && trialStep === 'rating') {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 min-h-screen">
+            <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md">
+            <button type="button" onClick={handleTrialBack} className="mb-5 flex items-center gap-2 text-sm font-bold text-slate-600 hover:text-slate-900 transition">
+              <ArrowLeft size={18} /> Back
+            </button>
+            <h2 className="text-xl font-bold text-center mb-6">Please rate this person as a potential dating partner.</h2>
+            <div className="mb-6">
+              <label className="block mb-2 font-bold text-slate-700">Desirability: {ratingDesirability}</label>
+              <input type="range" min="1" max="7" value={ratingDesirability} onChange={e => setRatingDesirability(Number(e.target.value))} className="w-full accent-rose-500" />
+              <div className="mt-1 flex justify-between text-xs text-slate-500"><span>1 — Extremely Undesirable</span><span>7 — Extremely Desirable</span></div>
+            </div>
+            <div className="mb-8">
+              <label className="block mb-2 font-bold text-slate-700">Willingness to Date: {ratingWillingness}</label>
+              <input type="range" min="1" max="7" value={ratingWillingness} onChange={e => setRatingWillingness(Number(e.target.value))} className="w-full accent-rose-500" />
+              <div className="mt-1 flex justify-between text-xs text-slate-500"><span>1 — Extremely Unwilling</span><span>7 — Extremely Willing</span></div>
+            </div>
+            <button onClick={handleRatingSubmit} className="w-full bg-slate-900 text-white font-bold py-3 rounded-xl">Confirm</button>
+            </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  const handleSourceEvaluationBack = () => {
+    if (currentSourceEvaluationIndex === 0) {
+      setFinalRatingDesirability(4);
+      setFinalRatingAttractiveness(4);
+      setPhase('final_face_instructions');
+      return;
+    }
+
+    const previousIndex = currentSourceEvaluationIndex - 1;
+    setSourceEvaluationData(previous => previous.filter(
+      evaluation => evaluation.evaluation_index < previousIndex + 1
+    ));
+    setFinalRatingDesirability(4);
+    setFinalRatingAttractiveness(4);
+    setCurrentSourceEvaluationIndex(previousIndex);
+  };
+
+  const handleSourceEvaluationSubmit = () => {
+    const stimulus = sourceEvaluationStimuli[currentSourceEvaluationIndex];
+    const evaluation = {
+      evaluation_index: currentSourceEvaluationIndex + 1,
+      stimulus_id: stimulus.id,
+      series_source: stimulus.series_source,
+      face_role: stimulus.face_role,
+      ratio_level: stimulus.ratio_level,
+      source_db_image: stimulus.source_db_image,
+      rating_desirability: finalRatingDesirability,
+      rating_attractiveness: finalRatingAttractiveness
+    };
+    const nextData = [
+      ...sourceEvaluationData.filter(item => item.evaluation_index !== evaluation.evaluation_index),
+      evaluation
+    ].sort((left, right) => left.evaluation_index - right.evaluation_index);
+    setSourceEvaluationData(nextData);
+
+    if (currentSourceEvaluationIndex < sourceEvaluationStimuli.length - 1) {
+      setCurrentSourceEvaluationIndex(previous => previous + 1);
+      setFinalRatingDesirability(4);
+      setFinalRatingAttractiveness(4);
+    } else {
+      setPhase('finish');
+    }
+  };
+
+  if (phase === 'final_face_instructions') {
+    return (
+      <Layout>
+        <div className="flex items-center justify-center p-6 min-h-screen">
+          <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-2xl">
+            <h2 className="text-2xl font-bold mb-6 text-slate-800">Final Face Ratings</h2>
+            <div className="space-y-4 text-slate-600 leading-relaxed">
+              <p>Please rate each face on desirability and attractiveness.</p>
+            </div>
+            <button onClick={() => setPhase('final_face_rating')} className="w-full mt-8 bg-slate-900 text-white font-bold py-3 rounded-xl hover:bg-slate-800 transition">Start Final Ratings</button>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (phase === 'final_face_rating') {
+    const currentStimulus = sourceEvaluationStimuli[currentSourceEvaluationIndex];
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 min-h-screen">
+          <div className="bg-white p-6 rounded-2xl shadow-xl w-full max-w-lg">
+            <button type="button" onClick={handleSourceEvaluationBack} className="mb-5 flex items-center gap-2 text-sm font-bold text-slate-600 hover:text-slate-900 transition">
+              <ArrowLeft size={18} /> Back
+            </button>
+            <img src={currentStimulus.url} className="w-full max-h-[46vh] object-contain rounded-2xl bg-slate-100 mb-6" alt="Face" />
+            <div className="mb-6">
+              <label className="block mb-2 font-bold text-slate-700">Desirability: {finalRatingDesirability}</label>
+              <input type="range" min="1" max="7" value={finalRatingDesirability} onChange={event => setFinalRatingDesirability(Number(event.target.value))} className="w-full accent-rose-500" />
+              <div className="mt-1 flex justify-between text-xs text-slate-500"><span>1 — Extremely Undesirable</span><span>7 — Extremely Desirable</span></div>
+            </div>
+            <div className="mb-8">
+              <label className="block mb-2 font-bold text-slate-700">Attractiveness: {finalRatingAttractiveness}</label>
+              <input type="range" min="1" max="7" value={finalRatingAttractiveness} onChange={event => setFinalRatingAttractiveness(Number(event.target.value))} className="w-full accent-rose-500" />
+              <div className="mt-1 flex justify-between text-xs text-slate-500"><span>1 — Extremely Unattractive</span><span>7 — Extremely Attractive</span></div>
+            </div>
+            <button onClick={handleSourceEvaluationSubmit} className="w-full bg-slate-900 text-white font-bold py-3 rounded-xl">Confirm</button>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (phase === 'finish') {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 text-center min-h-screen">
+          <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-lg">
+            <CheckCircle size={64} className="text-green-500 mx-auto mb-6" />
+            <h2 className="text-2xl font-bold mb-4">Thank You</h2>
+            <p className="text-slate-600 mb-8">Thank you for taking part in this study. We sincerely appreciate your time and participation.</p>
+
+            <button type="button" onClick={handleFinishExperiment} disabled={saveStatus === 'saving'} className={`w-full font-bold py-4 rounded-xl ${saveStatus === 'saving' ? 'bg-slate-300 text-slate-500 cursor-wait' : 'bg-slate-900 text-white hover:bg-slate-800'}`}>
+              {saveStatus === 'saving' ? 'Saving data and confirming SONA credit...' : saveStatus === 'error' ? 'Check Status / Retry Confirmation' : 'Finish Experiment'}
+            </button>
+
+            {saveStatus === 'saving' && <p className="text-sm text-slate-500 mt-4">Please keep this page open while your responses are saved and SONA credit is confirmed. Do not submit again.</p>}
+            {saveStatus === 'error' && <p className="text-red-500 font-bold mt-4">{saveError || 'The final operation failed. Please keep this page open and try again.'}</p>}
+            {isDemoMode && <p className="text-xs text-amber-500 mt-4">Demo mode is active; no data was sent to the research computer.</p>}
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (phase === 'end') {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center p-6 text-center min-h-screen">
+          <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-lg">
+            <CheckCircle size={64} className="text-green-500 mx-auto mb-6" />
+            <h2 className="text-2xl font-bold mb-4">Experiment Complete</h2>
+            <p className="text-slate-600 leading-relaxed">
+              Thank you for your participation. Your responses have been recorded, and the photographs uploaded for this study have been deleted. You may now close this page.
+            </p>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  return null;
+}
