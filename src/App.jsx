@@ -540,6 +540,8 @@ export default function App() {
             body: JSON.stringify({
               participant_id: participantId,
               merge_session_id: mergeSessionId,
+              sona_id: sonaId,
+              file_start_timestamp: fileStartTimestamp,
               self_image: selfPhoto,
               partner_image: partnerPhoto,
               self_gender: selfGender,
@@ -659,7 +661,7 @@ export default function App() {
       };
       processImages();
     }
-  }, [phase, apiUrl, participantId, mergeSessionId, selfPhoto, partnerPhoto, selfGender, partnerGender]);
+  }, [phase, apiUrl, participantId, mergeSessionId, sonaId, fileStartTimestamp, selfPhoto, partnerPhoto, selfGender, partnerGender]);
 
   // 记录试次开始时间
   useEffect(() => {
