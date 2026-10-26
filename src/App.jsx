@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { getPhotoProcessingError } from './photoErrors';
 // 引入图标库
 import { Heart, X, Star, User, ArrowRight, ArrowLeft, Download, CheckCircle, Loader2, Camera, RefreshCw, Check, UploadCloud, AlertCircle, Image as ImageIcon, ShoppingCart, Maximize, Minimize, RefreshCcw } from 'lucide-react';
 
@@ -308,6 +309,7 @@ export default function App() {
   const [saveStatus, setSaveStatus] = useState('idle'); 
   const [isDemoMode, setIsDemoMode] = useState(false); 
   const [processingError, setProcessingError] = useState('');
+  const [photoErrorKind, setPhotoErrorKind] = useState('quality');
   const [mergeQueuePosition, setMergeQueuePosition] = useState(null);
   const [saveError, setSaveError] = useState('');
   const [condition, setCondition] = useState('relationship'); 
@@ -432,6 +434,7 @@ export default function App() {
     setPhotoBatchId(null);
     setPhotoQualityChecks(null);
     setProcessingError('');
+    setPhotoErrorKind('quality');
     setIsDemoMode(false);
     setPhase('gender_select');
   };
@@ -534,6 +537,25 @@ export default function App() {
       mergeSubmittedRef.current = true;
 
       const processImages = async () => {
+        const handlePhotoProcessingError = (status, body, acceptAnyQualityError = false) => {
+          const photoError = getPhotoProcessingError(status, body, acceptAnyQualityError);
+          if (!photoError) return false;
+          setPhotoErrorKind(photoError.kind);
+          setProcessingError(photoError.message);
+          if (photoError.requiresNewPhotographs) {
+            setSelfPhoto(null);
+            setPartnerPhoto(null);
+            setStimuli([]);
+            setSourceEvaluationStimuli([]);
+            setPhotoQualityChecks(null);
+            setIsDemoMode(false);
+          }
+          setMergeQueuePosition(null);
+          mergeSubmittedRef.current = false;
+          setPhotoBatchId(null);
+          setPhase('photo_quality_error');
+          return true;
+        };
         try {
           console.log("Connecting to backend:", apiUrl);
           
@@ -558,23 +580,7 @@ export default function App() {
           if (!response.ok) {
             const errorBody = await response.json().catch(() => ({}));
 
-            const requiresNewPhotographs = response.status === 422 && [
-              'FACE_QUALITY_ERROR',
-              'FACE_OCCLUSION_ERROR'
-            ].includes(errorBody.code);
-            const photoCheckUnavailable = response.status === 503 &&
-              errorBody.code === 'FACE_OCCLUSION_CHECK_UNAVAILABLE';
-
-            if (requiresNewPhotographs || photoCheckUnavailable) {
-              setProcessingError(errorBody.error);
-              if (requiresNewPhotographs) {
-                setSelfPhoto(null);
-                setPartnerPhoto(null);
-              }
-              setPhotoBatchId(null);
-              setPhase('photo_quality_error');
-              return;
-            }
+            if (handlePhotoProcessingError(response.status, errorBody)) return;
 
             throw new Error(`Server status ${response.status}: ${errorBody.error || 'Unknown error'}`);
           }
@@ -609,19 +615,7 @@ export default function App() {
                 setPhase('processing_cancelled');
                 return;
               }
-              if (statusResponse.status === 422 ||
-                (statusResponse.status === 503 && statusBody.code === 'FACE_OCCLUSION_CHECK_UNAVAILABLE')) {
-                setProcessingError(statusBody.error);
-                if (statusResponse.status === 422) {
-                  setSelfPhoto(null);
-                  setPartnerPhoto(null);
-                }
-                setMergeQueuePosition(null);
-                mergeSubmittedRef.current = false;
-                setPhotoBatchId(null);
-                setPhase('photo_quality_error');
-                return;
-              }
+              if (handlePhotoProcessingError(statusResponse.status, statusBody, true)) return;
               throw new Error(
                 `Server status ${statusResponse.status}: ` +
                 (statusBody.error || 'Face processing failed')
@@ -1076,9 +1070,17 @@ export default function App() {
         <div className="flex flex-col items-center justify-center p-6 min-h-screen">
           <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-lg text-center">
             <AlertCircle size={56} className="text-amber-500 mx-auto mb-5" />
-            <h2 className="text-2xl font-bold mb-4 text-slate-800">Photo Check Needed</h2>
-            <p className="text-slate-600 leading-relaxed mb-4">{processingError}</p>
-            <p className="text-sm text-slate-500 mb-8">Please retake or replace both photographs. Each photograph must show one clear, front-facing face with a neutral expression and no glasses, sunglasses, or face coverings.</p>
+            <h2 className="text-2xl font-bold mb-4 text-slate-800">{photoErrorKind === 'unreadable' ? 'Photographs Could Not Be Read' : 'Photo Check Needed'}</h2>
+            <p className="text-slate-600 leading-relaxed whitespace-pre-line mb-4">{processingError}</p>
+            {photoErrorKind === 'unreadable' ? (
+              <>
+                <p className="text-sm text-slate-500 mb-4">Please retake or replace <strong>both photographs</strong>. If you are uploading existing photographs, please save or export them as <strong>JPG (JPEG) or PNG</strong> files before uploading them again.</p>
+                <p className="text-sm text-slate-500 mb-4">Each photograph must show one clear, front-facing face with a neutral expression and no glasses, sunglasses, or face coverings.</p>
+                <p className="text-sm text-slate-500 mb-8">If the problem persists after trying these steps, please contact the researcher.</p>
+              </>
+            ) : (
+              <p className="text-sm text-slate-500 mb-8">Please retake or replace both photographs. Each photograph must show one clear, front-facing face with a neutral expression and no glasses, sunglasses, or face coverings.</p>
+            )}
             <button type="button" onClick={() => setPhase('upload_self')} className="w-full bg-slate-900 text-white font-bold py-3 rounded-xl hover:bg-slate-800 transition">Retake Photos</button>
           </div>
         </div>
@@ -1100,7 +1102,8 @@ export default function App() {
                     <div>
                       <strong>Connection Failed</strong>
                       <p className="opacity-90 mt-1">The research server could not be reached or could not process your photographs.</p>
-                      <p className="opacity-90 mt-2">Please click Retry to reconnect. If you still cannot connect after several attempts, please contact the researcher. Demo mode uses practice images, does not save your responses, and does not award SONA credit.</p>
+                      <p className="opacity-90 mt-2">Please click <strong>Retry</strong> to reconnect. If you still cannot connect after several attempts, please close this page, wait a little while, and then restart the study. If the problem persists, please contact the researcher.</p>
+                      <p className="opacity-90 mt-2">Demo mode uses practice images, does not save your responses, and does not award SONA credit.</p>
                     </div>
                   </div>
                   
