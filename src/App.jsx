@@ -324,6 +324,7 @@ export default function App() {
 
   // 后端为本次两张照片生成的文件夹编号
   const [photoBatchId, setPhotoBatchId] = useState(null);
+  const [photoQualityChecks, setPhotoQualityChecks] = useState(null);
 
   const scrollContainerRef = useRef(null);
   const saveRevisionRef = useRef(0);
@@ -404,6 +405,7 @@ export default function App() {
     setApiUrl(tempApiUrl); // 更新实际使用的 URL
     setStimuli([]);
     setSourceEvaluationStimuli([]);
+    setPhotoQualityChecks(null);
     setIsDemoMode(false);  
     setMergeQueuePosition(null);
     setPhase('processing'); // 重新触发处理流程
@@ -428,6 +430,7 @@ export default function App() {
     setMainInstructionWaitSeconds(MAIN_INSTRUCTION_WAIT_SECONDS);
     setMainInstructionsCompleted(false);
     setPhotoBatchId(null);
+    setPhotoQualityChecks(null);
     setProcessingError('');
     setIsDemoMode(false);
     setPhase('gender_select');
@@ -501,7 +504,10 @@ export default function App() {
             series_source: seriesSource,
             face_role: isOriginal ? 'original' : ratio === 0 ? 'base_face' : 'blend',
             ratio_level: ratio,
-            source_db_image: isOriginal ? null : `demo/${seriesSource}_base_${faceIndex}.jpg`
+            source_db_image: isOriginal ? null : `demo/${seriesSource}_base_${faceIndex}.jpg`,
+            morph_diagnostics: {
+              version: 1, method: 'demo', degraded: null, reasons: ['demo_stimulus']
+            }
           });
         }
       }
@@ -640,6 +646,7 @@ export default function App() {
           setStimuli(result.images);
           setSourceEvaluationStimuli(result.source_evaluation_images);
           setPhotoBatchId(result.photo_batch_id || null);
+          setPhotoQualityChecks(result.photo_quality_checks ?? null);
           mergeSubmittedRef.current = false;
           setPhase('instructions');
 
@@ -648,6 +655,7 @@ export default function App() {
           setMergeQueuePosition(null);
           
           // 进入演示模式，但在界面上允许重试
+          setPhotoQualityChecks(null);
           setIsDemoMode(true); 
           const mockData = generateMockData();
           setStimuli(mockData.images);
@@ -754,6 +762,15 @@ export default function App() {
       sexual_orientation: selfGender === partnerGender ? 'homosexual' : 'heterosexual',
       partner_consent_obtained: partnerConsentObtained === true,
       photo_batch_id: photoBatchId,
+      photo_quality_checks: photoQualityChecks,
+      stimulus_processing: stimuli.map(stimulus => ({
+        stimulus_id: stimulus.id,
+        series_source: stimulus.series_source,
+        face_role: stimulus.face_role,
+        ratio_level: stimulus.ratio_level,
+        source_db_image: stimulus.source_db_image,
+        morph_diagnostics: stimulus.morph_diagnostics ?? null
+      })),
       user_profile: userProfileText,
       pre_questionnaire: questionnaireAnswers,
       experiment_data: data,
@@ -1266,6 +1283,7 @@ export default function App() {
       face_role: stim.face_role,
       ratio_level: stim.ratio_level,
       source_db_image: stim.source_db_image,
+      morph_diagnostics: stim.morph_diagnostics ?? null,
       action: action,
       reaction_time_ms: Math.round(rt),
     });
@@ -1389,6 +1407,7 @@ export default function App() {
       face_role: stimulus.face_role,
       ratio_level: stimulus.ratio_level,
       source_db_image: stimulus.source_db_image,
+      morph_diagnostics: stimulus.morph_diagnostics ?? null,
       rating_desirability: finalRatingDesirability,
       rating_attractiveness: finalRatingAttractiveness
     };
