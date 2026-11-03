@@ -11,7 +11,7 @@ const FINAL_SAVE_RETRY_DELAYS_MS = [0, 1200, 3000];
 const SONA_STATUS_POLL_INTERVAL_MS = 1500;
 const SONA_STATUS_MAX_WAIT_MS = 120000;
 const PROFILE_MINIMUM_WAIT_SECONDS = 10 * 60;
-const PROFILE_MINIMUM_WORDS = 50;
+const PROFILE_MINIMUM_WORDS = 120;
 const MAIN_INSTRUCTION_WAIT_SECONDS = 10;
 
 const createParticipantId = () => {
@@ -1182,7 +1182,7 @@ export default function App() {
                 <label className="flex items-center justify-between gap-3 text-slate-700 font-bold mb-2">
                     <span>Your Response:</span>
                     <span className={`text-xs font-medium ${hasMinimumProfileWords ? 'text-green-600' : 'text-slate-500'}`}>
-                        {profileWordCount}/<strong>50 words minimum</strong>
+                        {profileWordCount}/<strong>{PROFILE_MINIMUM_WORDS} words minimum</strong>
                     </span>
                 </label>
                 <textarea className="w-full border border-slate-300 rounded-xl p-4 h-80 focus:ring-2 focus:ring-rose-500 focus:outline-none transition-all resize-y text-sm leading-relaxed" 
@@ -1190,7 +1190,7 @@ export default function App() {
                     value={userProfileText} onChange={e=>setUserProfileText(e.target.value)} 
                 />
                 {!hasMinimumProfileWords && (
-                    <p className="mt-2 text-xs text-rose-500">Please write at least <strong>50 words</strong> before continuing.</p>
+                    <p className="mt-2 text-xs text-rose-500">Please write at least <strong>{PROFILE_MINIMUM_WORDS} words</strong> before continuing.</p>
                 )}
                 {!hasCompletedProfileWait && (
                     <p className="mt-2 text-xs text-slate-500">Next Step will be available in {profileWaitSeconds} seconds.</p>
