@@ -10,6 +10,11 @@ const DEFAULT_API_URL = import.meta.env.VITE_API_URL || 'https://crowd-municipal
 const FINAL_SAVE_RETRY_DELAYS_MS = [0, 1200, 3000];
 const SONA_STATUS_POLL_INTERVAL_MS = 1500;
 const SONA_STATUS_MAX_WAIT_MS = 120000;
+const SONA_CREDIT_FAILURE_MESSAGE = [
+  'You have completed all experimental tasks, and your responses have been saved. However, your SONA credit could not be confirmed automatically.',
+  'Please click Check Status / Retry Confirmation to try again. If credit confirmation is still unsuccessful after several attempts, please contact the researcher. You do not need to repeat the experiment.',
+  'The researcher normally reviews study completion daily and awards credit manually after verification.'
+].join('\n\n');
 const PROFILE_MINIMUM_WAIT_SECONDS = 10 * 60;
 const PROFILE_MINIMUM_WORDS = 120;
 const MAIN_INSTRUCTION_WAIT_SECONDS = 10;
@@ -331,6 +336,12 @@ export default function App() {
   const scrollContainerRef = useRef(null);
   const saveRevisionRef = useRef(0);
   const fileEndTimestampRef = useRef('');
+  const writingTaskTimingRef = useRef({
+    startTimestamp: null,
+    endTimestamp: null,
+    startPerformanceMs: null,
+    durationMs: null
+  });
   const mergeRequestInFlightRef = useRef(false);
   const mergeSubmittedRef = useRef(false);
   const currentPhaseRef = useRef(phase);
@@ -401,6 +412,34 @@ export default function App() {
     }, [data, sourceEvaluationData, phase]);
 
   // --- 事件处理函数 ---
+
+  const handleStartWritingTask = () => {
+    const timing = writingTaskTimingRef.current;
+    if (timing.startTimestamp === null) {
+      timing.startTimestamp = new Date().toISOString();
+      timing.startPerformanceMs = performance.now();
+    }
+    // Set refs before the phase change so its existing auto-save includes the start time.
+    setPhase('profile');
+  };
+
+  const handleFinishWritingTask = () => {
+    const wordCount = userProfileText.trim()
+      ? userProfileText.trim().split(/\s+/).length
+      : 0;
+    if (currentPhaseRef.current !== 'profile'
+      || profileWaitSeconds !== 0
+      || wordCount < PROFILE_MINIMUM_WORDS) return;
+
+    const timing = writingTaskTimingRef.current;
+    if (timing.startTimestamp === null || timing.startPerformanceMs === null) return;
+    if (timing.endTimestamp === null) {
+      timing.endTimestamp = new Date().toISOString();
+      timing.durationMs = Math.max(0, Math.round(performance.now() - timing.startPerformanceMs));
+    }
+    // Freeze the result before the questionnaire phase triggers its auto-save.
+    setPhase('questionnaire');
+  };
 
   // 处理重试逻辑 (确保只定义这一次)
   const handleRetryConnection = () => {
@@ -702,9 +741,9 @@ export default function App() {
     while (Date.now() < deadline) {
       if (current.status === 'success') return;
       if (current.status === 'failed') {
-        throw new Error(
-          `Your responses were saved, but SONA credit could not be confirmed: ${current.sona_completion?.message || 'Unknown error'}. Please click again to check and retry, or contact the researcher.`
-        );
+        throw Object.assign(new Error(SONA_CREDIT_FAILURE_MESSAGE), {
+          code: 'SONA_CREDIT_CONFIRMATION_FAILED'
+        });
       }
       if (current.status === 'unknown') {
         throw new Error('Your responses were saved, but SONA confirmation was interrupted. Please click again to check its status and retry, or contact the researcher.');
@@ -766,6 +805,9 @@ export default function App() {
         morph_diagnostics: stimulus.morph_diagnostics ?? null
       })),
       user_profile: userProfileText,
+      writing_task_start_timestamp: writingTaskTimingRef.current.startTimestamp,
+      writing_task_end_timestamp: writingTaskTimingRef.current.endTimestamp,
+      writing_task_duration_ms: writingTaskTimingRef.current.durationMs,
       pre_questionnaire: questionnaireAnswers,
       experiment_data: data,
       source_face_evaluations: sourceEvaluationData,
@@ -838,7 +880,9 @@ export default function App() {
     } catch (e) {
       console.error(e);
       if (!isPartial) {
-        setSaveError(`Unable to complete the experiment: ${e.message}`);
+        setSaveError(e.code === 'SONA_CREDIT_CONFIRMATION_FAILED'
+          ? SONA_CREDIT_FAILURE_MESSAGE
+          : `Unable to complete the experiment: ${e.message}`);
         setSaveStatus('error');
       }
       return false;
@@ -1129,7 +1173,7 @@ export default function App() {
             )}
 
             <p className="text-slate-600 mb-6 text-sm">System has prepared potential matches. Please follow your intuition.</p>
-            <button onClick={() => setPhase('profile')} className="w-full bg-slate-900 text-white font-bold py-3 rounded-xl">{isDemoMode ? 'Continue in Demo Mode (No Credit)' : 'Start Experiment'}</button>
+            <button onClick={handleStartWritingTask} className="w-full bg-slate-900 text-white font-bold py-3 rounded-xl">{isDemoMode ? 'Continue in Demo Mode (No Credit)' : 'Start Experiment'}</button>
             </div>
         </div>
       </Layout>
@@ -1196,7 +1240,7 @@ export default function App() {
                     <p className="mt-2 text-xs text-slate-500">Next Step will be available in {profileWaitSeconds} seconds.</p>
                 )}
             </div>
-            <button disabled={!canContinueProfile} onClick={() => setPhase('questionnaire')} className={`w-full font-bold py-4 rounded-xl transition-all duration-300 flex items-center justify-center gap-2 ${canContinueProfile ? 'bg-rose-500 hover:bg-rose-600 text-white shadow-lg hover:shadow-xl transform hover:-translate-y-0.5' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}>
+            <button disabled={!canContinueProfile} onClick={handleFinishWritingTask} className={`w-full font-bold py-4 rounded-xl transition-all duration-300 flex items-center justify-center gap-2 ${canContinueProfile ? 'bg-rose-500 hover:bg-rose-600 text-white shadow-lg hover:shadow-xl transform hover:-translate-y-0.5' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}>
                 <span>Next Step</span><ArrowRight size={20} />
             </button>
             </div>
@@ -1486,7 +1530,7 @@ export default function App() {
             </button>
 
             {saveStatus === 'saving' && <p className="text-sm text-slate-500 mt-4">Please keep this page open while your responses are saved and SONA credit is confirmed. Do not submit again.</p>}
-            {saveStatus === 'error' && <p className="text-red-500 font-bold mt-4">{saveError || 'The final operation failed. Please keep this page open and try again.'}</p>}
+            {saveStatus === 'error' && <p className="text-red-500 font-bold mt-4 whitespace-pre-line">{saveError || 'The final operation failed. Please keep this page open and try again.'}</p>}
             {isDemoMode && <p className="text-xs text-amber-500 mt-4">Demo mode is active; no data was sent to the research computer.</p>}
           </div>
         </div>
